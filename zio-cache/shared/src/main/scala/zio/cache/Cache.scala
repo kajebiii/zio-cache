@@ -76,7 +76,7 @@ abstract class Cache[-Key, +Error, +Value] {
    * by the lookup function. Additionally, `refresh` always triggers the
    * lookup function, disregarding the last `Error`.
    */
-  def refresh(key: Key): IO[Error, Unit]
+  def refresh(key: Key, onlyIfSucceeded: Boolean = false): IO[Error, Unit]
 
   /**
    * Invalidates the value associated with the specified key.
@@ -247,7 +247,7 @@ object Cache {
                 }
               }
 
-            override def refresh(in: In): IO[Error, Unit] =
+            override def refresh(in: In, onlyIfSucceeded: Boolean = false): IO[Error, Unit] =
               ZIO.suspendSucceedUnsafe { implicit u =>
                 val k       = keyBy(in)
                 val promise = newPromise()
@@ -256,7 +256,7 @@ object Cache {
                   value = map.putIfAbsent(k, MapValue.Pending(new MapKey(k), promise))
                 }
                 val result = if (value eq null) {
-                  lookupValueOf(in, promise)
+                  lookupValueOf(in, promise, onlyIfSucceeded)
                 } else {
                   value match {
                     case MapValue.Pending(_, promiseInProgress) =>
@@ -267,7 +267,7 @@ object Cache {
                         get(in)
                       } else {
                         // Only trigger the lookup if we're still the current value, `completedResult`
-                        lookupValueOf(in, promise).when {
+                        lookupValueOf(in, promise, onlyIfSucceeded).when {
                           map.replace(k, completedResult, MapValue.Refreshing(promise, completedResult))
                         }
                       }
@@ -292,7 +292,8 @@ object Cache {
             def size(implicit trace: Trace): UIO[Int] =
               ZIO.succeed(map.size)
 
-            private def lookupValueOf(in: In, promise: Promise[Error, Value]): IO[Error, Value] =
+            private def lookupValueOf(in: In, promise: Promise[Error, Value], onlyIfSucceeded: Boolean = false)
+              : IO[Error, Value] =
               ZIO.suspendSucceed {
                 val key = keyBy(in)
                 lookup(in)
@@ -302,7 +303,8 @@ object Cache {
                     val now        = Unsafe.unsafe(implicit u => clock.unsafe.instant())
                     val entryStats = EntryStats(now)
 
-                    map.put(key, MapValue.Complete(new MapKey(key), exit, entryStats, now.plus(timeToLive(exit))))
+                    if (!onlyIfSucceeded || exit.isSuccess)
+                      map.put(key, MapValue.Complete(new MapKey(key), exit, entryStats, now.plus(timeToLive(exit))))
                     promise.done(exit) *> ZIO.done(exit)
                   }
                   .onInterrupt(promise.interrupt *> ZIO.succeed(map.remove(key)))
