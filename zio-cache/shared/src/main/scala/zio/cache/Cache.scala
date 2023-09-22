@@ -79,6 +79,12 @@ abstract class Cache[-Key, +Error, +Value] {
   def refresh(key: Key): IO[Error, Unit]
 
   /**
+   * Computes the value associated with the specified key, with the lookup
+   * function, and puts it in the cache only if it is a value, not an error.
+   */
+  def refreshValue(key: Key): IO[Error, Unit]
+
+  /**
    * Invalidates the value associated with the specified key.
    */
   def invalidate(key: Key)(implicit trace: Trace): UIO[Unit]
@@ -247,7 +253,13 @@ object Cache {
                 }
               }
 
-            override def refresh(in: In): IO[Error, Unit] =
+            def refresh(in: In): IO[Error, Unit] =
+              refresh(in, rollbackIfError = false)
+
+            def refreshValue(in: In): IO[Error, Unit] =
+              refresh(in, rollbackIfError = true)
+
+            private def refresh(in: In, rollbackIfError: Boolean): IO[Error, Unit] =
               ZIO.suspendSucceedUnsafe { implicit u =>
                 val k       = keyBy(in)
                 val promise = newPromise()
@@ -256,7 +268,8 @@ object Cache {
                   value = map.putIfAbsent(k, MapValue.Pending(new MapKey(k), promise))
                 }
                 val result = if (value eq null) {
-                  lookupValueOf(in, promise)
+                  val rollbackResultIfError = if (rollbackIfError) Right(None) else Left(())
+                  lookupValueOf(in, promise, rollbackResultIfError)
                 } else {
                   value match {
                     case MapValue.Pending(_, promiseInProgress) =>
@@ -267,7 +280,8 @@ object Cache {
                         get(in)
                       } else {
                         // Only trigger the lookup if we're still the current value, `completedResult`
-                        lookupValueOf(in, promise).when {
+                        val rollbackResultIfError = if (rollbackIfError) Right(Some(completedResult)) else Left(())
+                        lookupValueOf(in, promise, rollbackResultIfError).when {
                           map.replace(k, completedResult, MapValue.Refreshing(promise, completedResult))
                         }
                       }
@@ -292,7 +306,16 @@ object Cache {
             def size(implicit trace: Trace): UIO[Int] =
               ZIO.succeed(map.size)
 
-            private def lookupValueOf(in: In, promise: Promise[Error, Value]): IO[Error, Value] =
+            private def lookupValueOf(
+              in: In,
+              promise: Promise[Error, Value],
+              /**
+               * Left(()): Put the lookup result.
+               * Right(None): Remove key if there is an error.
+               * Right(Some(rollbackResult)): Rollback if there is an error.
+               */
+              rollbackResultIfError: Either[Unit, Option[MapValue.Complete[Key, Error, Value]]] = Left(())
+            ): IO[Error, Value] =
               ZIO.suspendSucceed {
                 val key = keyBy(in)
                 lookup(in)
@@ -302,7 +325,18 @@ object Cache {
                     val now        = Unsafe.unsafe(implicit u => clock.unsafe.instant())
                     val entryStats = EntryStats(now)
 
-                    map.put(key, MapValue.Complete(new MapKey(key), exit, entryStats, now.plus(timeToLive(exit))))
+                    if (exit.isSuccess)
+                      map.put(key, MapValue.Complete(new MapKey(key), exit, entryStats, now.plus(timeToLive(exit))))
+                    else
+                      rollbackResultIfError match {
+                        case Left(()) =>
+                          map.put(key, MapValue.Complete(new MapKey(key), exit, entryStats, now.plus(timeToLive(exit))))
+                        case Right(None) =>
+                          map.remove(key)
+                        case Right(Some(rollbackResult)) =>
+                          map.put(key, rollbackResult)
+                      }
+
                     promise.done(exit) *> ZIO.done(exit)
                   }
                   .onInterrupt(promise.interrupt *> ZIO.succeed(map.remove(key)))
